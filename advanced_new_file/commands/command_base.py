@@ -2,12 +2,21 @@ import errno
 import os
 import re
 import sublime
+import sublime_plugin
+import shlex
 
 from ..anf_util import *
 from ..platform.windows_platform import WindowsPlatform
 from ..platform.nix_platform import NixPlatform
 from ..completions.nix_completion import NixCompletion
 from ..completions.windows_completion import WindowsCompletion
+
+if not IS_ST3:
+    if PLATFORM == "windows":
+        import sys
+        sys.path.append(os.path.dirname(sys.executable))
+    from ..lib.ushlex import split as st2_shlex_split
+
 
 VIEW_NAME = "AdvancedNewFileCreation"
 
@@ -23,33 +32,40 @@ class AdvancedNewFileBase(object):
             self.platform = NixPlatform()
 
     def __generate_default_root(self):
-        default_root = self.__get_default_root(
-            self.settings.get(DEFAULT_ROOT_SETTING))
-        if default_root == "path":
-            self.root = os.path.expanduser(
-                self.settings.get(DEFAULT_PATH_SETTING))
-            default_root = ""
-        return self.split_path(default_root)
+        root_setting = self._get_default_root()
+        path, folder_index = self.__parse_path_setting(
+            root_setting, DEFAULT_FOLDER_INDEX_SETTING)
+        if path is None and folder_index is None:
+            return os.path.expanduser(self.settings.get(DEFAULT_PATH_SETTING))
+        elif path is None:
+            return self.__project_folder_from_index(folder_index)
+        return path
 
     def __generate_alias_root(self):
-        alias_root = self.__get_default_root(
-            self.settings.get(ALIAS_ROOT_SETTING), True)
-        if alias_root == "path":
-            self.alias_root = os.path.expanduser(
-                self.settings.get(ALIAS_PATH_SETTING))
-            alias_root = ""
-        return self.split_path(alias_root, True)
+        path, folder_index = self.__parse_path_setting(
+            self.settings.get(ALIAS_ROOT_SETTING), ALIAS_FOLDER_INDEX_SETTING)
+        if path is None and folder_index is None:
+            return os.path.expanduser(self.settings.get(ALIAS_PATH_SETTING))
+        elif path is None:
+            if folder_index >= 0:
+                return self.window.folders()[folder_index]
+            else:
+                return os.path.expanduser("~/")
+        return path
 
     def generate_initial_path(self, initial_path=None):
+        path = None
         # Search for initial string
         if initial_path is not None:
             path = initial_path
         else:
-            _, path = self.__generate_default_root()
             if self.settings.get(USE_CURSOR_TEXT_SETTING, False):
                 cursor_text = self.get_cursor_path()
                 if cursor_text != "":
                     path = cursor_text
+
+            if path is None:
+                path = self.settings.get(DEFAULT_INITIAL_SETTING)
 
         return path
 
@@ -60,8 +76,8 @@ class AdvancedNewFileBase(object):
         self.alias_root = None
         self.aliases = self.__get_aliases()
 
-        self.root, _ = self.__generate_default_root()
-        self.alias_root, _ = self.__generate_alias_root()
+        self.root = self.__generate_default_root()
+        self.alias_root = self.__generate_alias_root()
 
         # Need to fix this
         debug = self.settings.get(DEBUG_SETTING) or False
@@ -81,38 +97,69 @@ class AdvancedNewFileBase(object):
 
         return aliases
 
-    def __get_default_root(self, string, is_alias=False):
-        root = ""
-        self.alias_folder_index = self.settings.get(ALIAS_FOLDER_INDEX_SETTING)
-        self.default_folder_index = self.settings.get(
-            DEFAULT_FOLDER_INDEX_SETTING)
-        if string == "home":
-            root = "~/"
-        elif string == "current":
-            root = TOP_LEVEL_SPLIT_CHAR
-        elif string == "project_folder":
-            num_folders = len(self.window.folders())
-            if is_alias:
-                if num_folders <= self.alias_folder_index:
-                    self.alias_folder_index = 0
-            elif num_folders <= self.default_folder_index:
-                self.default_folder_index = 0
-        elif string == "top_folder":
-            if is_alias:
-                self.alias_folder_index = 0
-            else:
-                self.default_folder_index = 0
-        elif string == "path":
-            root = "path"
+    def __parse_path_setting(self, setting, index_setting):
+        root = None
+        folder_index = None
+        if setting == "home":
+            root = os.path.expanduser("~/")
+        elif setting == "current":
+            if self.view is not None:
+                filename = self.view.file_name()
+                if filename is not None:
+                    root = os.path.dirname(filename)
+            if root is None:
+                if self.settings.get(CURRENT_FALLBACK_TO_PROJECT_SETTING, False):
+                    folder_index = self.__validate_folder_index(0)
+                    if folder_index == -1:
+                        root = os.path.expanduser("~/")
+                else:
+                    root = os.path.expanduser("~/")
+        elif setting == "project_folder":
+            folder_index = self.settings.get(index_setting)
+            folder_index = self.__validate_folder_index(folder_index)
+        elif setting == "top_folder":
+            folder_index = self.__validate_folder_index(0)
+        elif setting == "path":
+            pass
         else:
-            print("Invalid specifier for \"default_root\"")
-        return root
+            print("Invalid root specifier")
 
-    def split_path(self, path="", is_alias=False):
+        return (root, folder_index)
+
+    def __validate_folder_index(self, folder_index):
+        num_folders = len(self.window.folders())
+        if num_folders == 0:
+            folder_index = -1
+        elif num_folders < folder_index:
+            folder_index = 0
+        return folder_index
+
+    def __parse_for_shell_input(self, path):
+        if not IS_ST3 and self.__contains_non_ascii(path):
+            split_path = self.__split_shell_input_for_st2_non_ascii(path)
+        else:
+            split_path = shlex.split(str(path))
+
+        return " ".join(split_path)
+
+    def __split_shell_input_for_st2_non_ascii(self, path):
+        return st2_shlex_split(path)
+
+    def __contains_non_ascii(self, string):
+        # Don't really like this....
+        try:
+            string.decode("ascii")
+        except UnicodeEncodeError:
+            return True
+        return False
+
+    def split_path(self, path=""):
         HOME_REGEX = r"^~[/\\]"
         root = None
         try:
             root, path = self.platform.split(path)
+            if self.settings.get(SHELL_INPUT_SETTING, False) and len(path) > 0:
+                path = self.__parse_for_shell_input(path)
             # Parse if alias
             if TOP_LEVEL_SPLIT_CHAR in path and root is None:
                 parts = path.rsplit(TOP_LEVEL_SPLIT_CHAR, 1)
@@ -133,7 +180,13 @@ class AdvancedNewFileBase(object):
             elif (re.match(r"^\.{1,2}[/\\]", path) and
                   self.settings.get(RELATIVE_FROM_CURRENT_SETTING, False)):
                 path_index = 2
-                root = os.path.dirname(self.view.file_name())
+                if self.view.file_name() is not None:
+                    root = os.path.dirname(self.view.file_name())
+                else:
+                    folder_index = self.settings.get(
+                        RELATIVE_FALLBACK_INDEX_SETTING, 0)
+                    folder_index = self.__validate_folder_index(folder_index)
+                    root = self.__project_folder_from_index(folder_index)
                 if re.match(r"^\.{2}[/\\]", path):
                     root = os.path.dirname(root)
                     path_index = 3
@@ -141,17 +194,25 @@ class AdvancedNewFileBase(object):
 
             # Default
             if root is None:
-                if is_alias:
-                    root = self.alias_root
-                    folder_index = self.alias_folder_index
-                else:
-                    root = self.root
-                    folder_index = self.default_folder_index
-                root = root or self.window.folders()[folder_index]
+                root = self.root
         except IndexError:
             root = os.path.expanduser("~")
 
         return root, path
+
+    def __project_folder_from_index(self, folder_index):
+        if folder_index >= 0:
+            return self.window.folders()[folder_index]
+        else:
+            return os.path.expanduser("~/")
+
+    def bash_expansion(self, path):
+        if len(path) == 0:
+            return path
+
+        split_path = shlex.split(path)
+        new_path = " ".join(split_path)
+        return new_path
 
     def __translate_alias(self, path):
         root = None
@@ -190,8 +251,10 @@ class AdvancedNewFileBase(object):
                 join_index -= 1
 
         if root is None:
+            # Nothing found
             return None, path
         elif split_path is None:
+            # Current directory as alias
             return os.path.abspath(root), ""
         else:
             # Add to index so we re
@@ -203,8 +266,10 @@ class AdvancedNewFileBase(object):
         return ""
 
     def show_filename_input(self, initial):
+        caption = self.input_panel_caption()
+
         self.input_panel_view = self.window.show_input_panel(
-            self.input_panel_caption(), initial,
+            caption, initial,
             self.on_done, self.__update_filename_input, self.clear
         )
 
@@ -214,6 +279,8 @@ class AdvancedNewFileBase(object):
         self.input_panel_view.settings().set("tab_completion", False)
         self.input_panel_view.settings().set("translate_tabs_to_spaces", False)
         self.input_panel_view.settings().set("anf_panel", True)
+        if self.settings.get(CURSOR_BEFORE_EXTENSION_SETTING):
+            self.__place_cursor_before_extension(self.input_panel_view)
 
     def __update_filename_input(self, path_in):
         new_content = path_in
@@ -240,9 +307,14 @@ class AdvancedNewFileBase(object):
     def entered_file_action(self, path):
         pass
 
+    def empty_file_action(self):
+        pass
+
     def on_done(self, input_string):
         if len(input_string) != 0:
             self.entered_filename(input_string)
+        elif self.settings.get(DEFAULT_NEW_FILE, False):
+            self.empty_file_action()
 
         self.clear()
         self.refresh_sidebar()
@@ -319,8 +391,8 @@ class AdvancedNewFileBase(object):
             if ex.errno != errno.EEXIST:
                 raise
 
-        file_permissions = self.settings.get("file_permissions", "")
-        folder_permissions = self.settings.get("folder_permissions", "")
+        file_permissions = self.settings.get(FILE_PERMISSIONS_SETTING, "")
+        folder_permissions = self.settings.get(FOLDER_PERMISSIONS_SETTING, "")
         for entry in init_list:
             if self.is_python:
                 creation_path = os.path.join(entry, '__init__.py')
@@ -341,11 +413,24 @@ class AdvancedNewFileBase(object):
             if region.begin() != region.end():
                 path = view.substr(region)
                 break
-            if re.match(".*string.quoted.double", syntax) or re.match(".*string.quoted.single", syntax):
+            if (re.match(".*string.quoted.double", syntax) or
+                    re.match(".*string.quoted.single", syntax)):
                 path = view.substr(view.extract_scope(region.begin()))
                 path = re.sub('^"|\'', '',  re.sub('"|\'$', '', path.strip()))
                 break
 
+        return path
+
+    def _expand_default_path(self, path):
+        current_file = self.view.file_name()
+        if current_file:
+            directory, current_file_name = os.path.split(current_file)
+            path = path.replace("<filepath>", current_file)
+            path = path.replace("<filedirectory>", directory + os.sep)
+        else:
+            current_file_name = ""
+
+        path = path.replace("<filename>", current_file_name)
         return path
 
     def _find_open_file(self, file_name):
@@ -358,3 +443,26 @@ class AdvancedNewFileBase(object):
                 if view_name != "" and view_name == file_name:
                     return view
         return None
+
+    ## Should be overridden by sub class
+    def get_default_root_setting(self):
+        return DEFAULT_ROOT_SETTING
+
+    def _get_default_root(self):
+        root_setting_value = self.get_default_root_setting()
+        root_setting = self.settings.get(root_setting_value)
+        if root_setting == DEFAULT_ROOT_SETTING:
+            return self.settings.get(DEFAULT_ROOT_SETTING)
+        return root_setting
+
+    def __place_cursor_before_extension(self, view):
+        if view.settings().get("anf_panel", False):
+            cursors = view.sel()
+            cursor = cursors[0]
+            line_region = view.line(cursor)
+            content = view.substr(line_region)
+            matcher = re.match(r"(.+)\..+", content)
+            if matcher:
+                initial_position = len(matcher.group(1))
+                cursors.clear()
+                cursors.add(sublime.Region(initial_position, initial_position))
